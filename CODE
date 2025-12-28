@@ -1,0 +1,446 @@
+import 'dotenv/config';
+import express from "express";
+import cors from "cors";
+import bodyParser from "body-parser";
+import mongoose from "mongoose";
+import authRoutes from "./routes/auth.js";
+import paymentRoutes from "./routes/payments.js";
+import webhookRoutes from "./routes/webhooks.js";
+import merchantRoutes from "./routes/merchants.js";
+import adminRoutes from "./routes/admin.js";
+import payoutRoutes from "./routes/payouts.js";
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use('/api/webhooks/stripe', bodyParser.raw({ type: 'application/json' }));
+
+mongoose.connect(process.env.MONGODB_URI || "mongodb://127.0.0.1/paycash");
+
+app.use("/api/auth", authRoutes);
+app.use("/api/payments", paymentRoutes);
+app.use("/api/merchants", merchantRoutes);
+app.use("/api/admin", adminRoutes);
+app.use("/api/webhooks", webhookRoutes);
+app.use("/api/payouts", payoutRoutes);
+
+app.listen(process.env.PORT || 5000, () => console.log("PayCash backend running"));
+{
+  "name": "paycash-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "mongoose": "^7.5.0",
+    "stripe": "^12.0.0",
+    "bcrypt": "^5.1.0",
+    "jsonwebtoken": "^9.0.0",
+    "dotenv": "^16.0.0",
+    "cors": "^2.8.5",
+    "body-parser": "^1.20.2"
+  }
+}
+MONGODB_URI=mongodb://127.0.0.1/paycash
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+JWT_SECRET=your_jwt_secret
+import Stripe from "stripe";
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+export default stripe;
+import mongoose from "mongoose";
+const userSchema = new mongoose.Schema({
+  email: { type: String, unique: true },
+  passwordHash: String,
+  role: { type: String, enum: ['user', 'merchant', 'admin'], default: 'user' },
+  merchant: { type: mongoose.Schema.Types.ObjectId, ref: 'Merchant' },
+  verified: { type: Boolean, default: false }
+});
+export default mongoose.model('User', userSchema);
+import mongoose from "mongoose";
+const merchantSchema = new mongoose.Schema({
+  name: String,
+  stripeAccountId: String,
+  status: { type: String, default: 'pending' }
+});
+export default mongoose.model('Merchant', merchantSchema);
+import mongoose from "mongoose";
+const transactionSchema = new mongoose.Schema({
+  stripeEventId: String,
+  amount: Number,
+  currency: String,
+  merchant: { type: mongoose.Schema.Types.ObjectId, ref: 'Merchant' },
+  payout: { type: mongoose.Schema.Types.ObjectId, ref: 'Payout' }
+});
+export default mongoose.model('Transaction', transactionSchema);
+import mongoose from "mongoose";
+const payoutSchema = new mongoose.Schema({
+  merchant: { type: mongoose.Schema.Types.ObjectId, ref: 'Merchant' },
+  amount: Number,
+  currency: String,
+  status: String,
+  stripePayoutId: String
+});
+export default mongoose.model('Payout', payoutSchema);
+import express from "express";
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
+import User from "../models/User.js";
+
+const router = express.Router();
+
+router.post('/register', async (req, res) => {
+  const { email, password } = req.body;
+  const passwordHash = await bcrypt.hash(password, 10);
+  const user = new User({ email, passwordHash });
+  await user.save();
+  res.json({ message: 'User registered' });
+});
+
+router.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+  const user = await User.findOne({ email });
+  if (!user || !await bcrypt.compare(password, user.passwordHash)) return res.status(401).json({ error: 'Invalid credentials' });
+  if (!user.verified) return res.status(401).json({ error: 'Email not verified' });
+  const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
+  res.json({ token, user });
+});
+
+router.get('/verify', async (req, res) => {
+  const { token } = req.query;
+  // Mock verification
+  const user = await User.findOneAndUpdate({ email: 'user@example.com' }, { verified: true });
+  res.json({ message: 'Verified' });
+});
+
+export default router;
+import express from "express";
+import stripe from "../config/stripe.js";
+import Transaction from "../models/Transaction.js";
+import Merchant from "../models/Merchant.js";
+
+const router = express.Router();
+
+router.post("/create-payment", async (req, res) => {
+  const { amount, merchantStripeId } = req.body;
+  const session = await stripe.checkout.sessions.create({
+    payment_method_types: ["card"],
+    mode: "payment",
+    line_items: [{
+      price_data: {
+        currency: "usd",
+        product_data: { name: "PayCash Payment" },
+        unit_amount: amount * 100,
+      },
+      quantity: 1,
+    }],
+    payment_intent_data: {
+      application_fee_amount: Math.round(amount * 0.05 * 100),
+      transfer_data: {
+        destination: merchantStripeId,
+      },
+    },
+    success_url: "https://paycash.app/success",
+    cancel_url: "https://paycash.app/cancel",
+  });
+  res.json({ url: session.url });
+});
+
+router.post("/connect/create-account", async (req, res) => {
+  const account = await stripe.accounts.create({ type: 'express' });
+  const merchant = new Merchant({ stripeAccountId: account.id });
+  await merchant.save();
+  res.json({ account });
+});
+
+router.post("/connect/payout", async (req, res) => {
+  const { amount, merchantId } = req.body;
+  const merchant = await Merchant.findById(merchantId);
+  const transfer = await stripe.transfers.create({
+    amount: amount * 100,
+    currency: 'usd',
+    destination: merchant.stripeAccountId,
+  });
+  res.json({ transfer });
+});
+
+export default router;
+import express from "express";
+import stripe from "../config/stripe.js";
+import Transaction from "../models/Transaction.js";
+
+const router = express.Router();
+
+router.post("/stripe", express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const transaction = new Transaction({
+      stripeEventId: event.id,
+      amount: session.amount_total / 100,
+      currency: session.currency,
+      merchant: session.metadata.merchantId
+    });
+    await transaction.save();
+  }
+  res.json({ received: true });
+});
+
+export default router;
+import express from "express";
+import Transaction from "../models/Transaction.js";
+
+const router = express.Router();
+
+router.get("/transactions", async (req, res) => {
+  const transactions = await Transaction.find().populate('merchant');
+  res.json(transactions);
+});
+
+export default router;
+import express from "express";
+import Payout from "../models/Payout.js";
+
+const router = express.Router();
+
+router.get("/", async (req, res) => {
+  const payouts = await Payout.find().populate('merchant');
+  res.json(payouts);
+});
+
+export default router;
+import jwt from "jsonwebtoken";
+
+export default (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'No token' });
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+};
+{
+  "name": "paycash-mobile",
+  "version": "1.0.0",
+  "main": "App.js",
+  "scripts": {
+    "start": "expo start"
+  },
+  "dependencies": {
+    "@react-navigation/native": "^6.1.6",
+    "@react-navigation/stack": "^6.3.16",
+    "react-native-screens": "^3.20.0",
+    "react-native-safe-area-context": "^4.5.0",
+    "expo": "^48.0.0",
+    "react-native-qrcode-svg": "^6.2.0",
+    "@react-native-async-storage/async-storage": "^1.18.1"
+  }
+}
+import React from "react";
+import { NavigationContainer } from "@react-navigation/native";
+import { createStackNavigator } from "@react-navigation/stack";
+import Login from "./screens/Login";
+import Register from "./screens/Register";
+import Dashboard from "./screens/Dashboard";
+import QRPay from "./screens/QRPay";
+import Payments from "./screens/Payments";
+import Payouts from "./screens/Payouts";
+
+const Stack = createStackNavigator();
+
+export default function App() {
+  return (
+    <NavigationContainer>
+      <Stack.Navigator>
+        <Stack.Screen name="Login" component={Login} />
+        <Stack.Screen name="Register" component={Register} />
+        <Stack.Screen name="Dashboard" component={Dashboard} />
+        <Stack.Screen name="QRPay" component={QRPay} />
+        <Stack.Screen name="Payments" component={Payments} />
+        <Stack.Screen name="Payouts" component={Payouts} />
+      </Stack.Navigator>
+    </NavigationContainer>
+  );
+}
+import React, { useState } from "react";
+import { View, TextInput, Button, Text } from "react-native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export default function Login({ navigation }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+
+  const login = async () => {
+    const res = await fetch("https://your-backend-url/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json();
+    if (data.token) {
+      await AsyncStorage.setItem("token", data.token);
+      await AsyncStorage.setItem("user", JSON.stringify(data.user));
+      navigation.navigate("Dashboard");
+    }
+  };
+
+  return (
+    <View>
+      <TextInput placeholder="Email" value={email} onChangeText={setEmail} />
+      <TextInput placeholder="Password" value={password} onChangeText={setPassword} secureTextEntry />
+      <Button title="Login" onPress={login} />
+      <Text onPress={() => navigation.navigate("Register")}>Register</Text>
+    </View>
+  );
+}
+import React, { useState } from "react";
+import { View, TextInput, Button } from "react-native";
+
+export default function Register({ navigation }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+
+  const register = async () => {
+    await fetch("https://your-backend-url/api/auth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    navigation.navigate("Login");
+  };
+
+  return (
+    <View>
+      <TextInput placeholder="Email" value={email} onChangeText={setEmail} />
+      <TextInput placeholder="Password" value={password} onChangeText={setPassword} secureTextEntry />
+      <Button title="Register" onPress={register} />
+    </View>
+  );
+}
+import React, { useState } from "react";
+import { View, TextInput, Button } from "react-native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export default function Payments() {
+  const [amount, setAmount] = useState("");
+
+  const createPayment = async () => {
+    const token = await AsyncStorage.getItem("token");
+    const res = await fetch("https://your-backend-url/api/payments/create-payment", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ amount: parseFloat(amount), merchantStripeId: "acct_..." }),
+    });
+    const data = await res.json();
+    // Open data.url in browser
+  };
+
+  return (
+    <View>
+      <TextInput placeholder="Amount" value={amount} onChangeText={setAmount} />
+      <Button title="Create Payment" onPress={createPayment} />
+    </View>
+  );
+}
+import React, { useEffect, useState } from "react";
+import { View, Text } from "react-native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export default function Payouts() {
+  const [payouts, setPayouts] = useState([]);
+
+  useEffect(() => {
+    const fetchPayouts = async () => {
+      const token = await AsyncStorage.getItem("token");
+      const res = await fetch("https://your-backend-url/api/payouts", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      setPayouts(data);
+    };
+    fetchPayouts();
+  }, []);
+
+  return (
+    <View>
+      {payouts.map(p => <Text key={p._id}>{p.amount}</Text>)}
+    </View>
+  );
+}
+import React from "react";
+import QRCode from "react-native-qrcode-svg";
+import { View, Text } from "react-native";
+
+export default function QRPay() {
+  const paymentLink = "https://your-backend-url/pay/123";
+
+  return (
+    <View>
+      <Text>Scan to Pay</Text>
+      <QRCode value={paymentLink} size={220} />
+    </View>
+  );
+}
+<!DOCTYPE html>
+<html>
+<head>
+  <title>PayCash Admin</title>
+</head>
+<body>
+  <h1>PayCash Admin</h1>
+  <button onclick="loadMerchants()">Load Merchants</button>
+  <div id="merchants"></div>
+  <button onclick="loadTransactions()">Load Transactions</button>
+  <div id="transactions"></div>
+  <script>
+    const apiUrl = 'https://your-backend-url/api';
+
+    async function loadMerchants() {
+      const res = await fetch(`${apiUrl}/merchants`);
+      const data = await res.json();
+      document.getElementById('merchants').innerHTML = JSON.stringify(data);
+    }
+
+    async function loadTransactions() {
+      const res = await fetch(`${apiUrl}/admin/transactions`);
+      const data = await res.json();
+      document.getElementById('transactions').innerHTML = JSON.stringify(data);
+    }
+  </script>
+</body>
+</html>
+version: '3.8'
+services:
+  mongo:
+    image: mongo:6
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+  backend:
+    build: ./backend
+    ports:
+      - "5000:5000"
+    environment:
+      - MONGODB_URI=mongodb://mongo:27017/paycash
+      - STRIPE_SECRET_KEY=your_key
+      - STRIPE_WEBHOOK_SECRET=your_secret
+      - JWT_SECRET=your_secret
+    depends_on:
+      - mongo
+volumes:
+  mongo_data:
