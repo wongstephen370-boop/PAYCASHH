@@ -149,3 +149,6 @@ next-env.d.ts
 git add .
 git commit -m "PayCash production deployment setup"
 git push origin main
+git add package.json README.md
+git commit -m "Fix package.json - frontend only in root"
+git push origin main
