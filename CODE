@@ -135,4 +135,7 @@ next-env.d.ts
 *.swp
 *.swo
 *~
+git add .
+git commit -m "Fix API routes - move to correct Next.js app/api structure"
+git push origin main
 
