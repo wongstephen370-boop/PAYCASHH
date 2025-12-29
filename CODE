@@ -1,3 +1,9 @@
+PAYCASHH/
+├── package.json  
+├── next.config.js
+├── app/ or pages/
+├── public/
+└── tsconfig.json
 {
   "name": "paycash",
   "version": "1.0.0",
